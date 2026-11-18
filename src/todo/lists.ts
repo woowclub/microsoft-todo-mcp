@@ -13,9 +13,10 @@ export class TaskListsApi {
       () => this.graph.request<Page<unknown>>("GET", "/me/todo/lists", { query: { $top: PAGE_SIZE }, traceId: opts.traceId }),
       (url) => this.graph.request<Page<unknown>>("GET", url, { traceId: opts.traceId }),
       cap,
+      "/me/todo/lists",
       opts.cursor,
     );
-    return { items: result.items.map((x) => TaskListSchema.parse(x)), hasMore: result.hasMore, cursor: result.cursor };
+    return { items: result.items.filter(isOwned).map((x) => TaskListSchema.parse(x)), hasMore: result.hasMore, cursor: result.cursor };
   }
 
   async create(displayName: string, traceId?: string): Promise<TaskList> {
@@ -31,4 +32,9 @@ export class TaskListsApi {
   async remove(listId: string, traceId?: string): Promise<void> {
     await this.graph.request<void>("DELETE", `/me/todo/lists/${encodeURIComponent(listId)}`, { traceId });
   }
+}
+
+
+function isOwned(resource: unknown): boolean {
+  return typeof resource === "object" && resource !== null && "isOwner" in resource && resource.isOwner === true;
 }

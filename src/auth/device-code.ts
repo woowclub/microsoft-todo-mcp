@@ -1,56 +1,58 @@
-import { LogLevel, PublicClientApplication } from "@azure/msal-node";
-import type { AccountInfo, AuthenticationResult } from "@azure/msal-node";
+import { PublicClientApplication, type AccountInfo, type AuthenticationResult } from "@azure/msal-node";
+import { microsoftIdentityNetwork } from "./network";
 import { fileCachePlugin } from "./token-cache";
 import { AppError } from "../graph/errors";
-import type { AppConfig } from "../config";
-import type { Logger } from "../lib/logger";
+import { hasExpectedScopes, scopesFor, PERSONAL_AUTHORITY, PERSONAL_TENANT, type AppConfig } from "../config";
 
-/** The bits of MSAL's device-code response we surface (a subset of `DeviceCodeResponse`). */
-export interface DeviceCodeInfo {
-  userCode: string;
-  verificationUri: string;
-  message: string;
-  /** Seconds until the code expires. */
-  expiresIn: number;
-}
-
-export function createPca(config: AppConfig, logger: Logger): PublicClientApplication {
-  if (!config.clientId) {
-    throw new AppError(
-      "config_error",
-      "No Microsoft Entra client ID configured. Register an app (see docs/ENTRA-APP-SETUP.md) and set MS_TODO_CLIENT_ID.",
-    );
-  }
+export function createPca(config: AppConfig): PublicClientApplication {
+  if (!config.clientId) throw new AppError("config_error", "Set MS_TODO_CLIENT_ID to your personal app registration.");
   return new PublicClientApplication({
-    auth: { clientId: config.clientId, authority: config.authority },
+    auth: { clientId: config.clientId, authority: PERSONAL_AUTHORITY },
     cache: { cachePlugin: fileCachePlugin(config.tokenCachePath) },
-    system: {
-      loggerOptions: {
-        piiLoggingEnabled: false,
-        logLevel: LogLevel.Warning,
-        loggerCallback: (_level, message, containsPii) => {
-          if (!containsPii) logger.debug("msal", { msal: message });
-        },
-      },
-    },
+    system: { networkClient: microsoftIdentityNetwork(scopesFor(config)), loggerOptions: { piiLoggingEnabled: false, loggerCallback: () => {} } },
   });
 }
 
-/**
- * Run the device-code flow. `onDeviceCode` fires once, early, with the code/URL/message;
- * the returned promise then polls until the user completes the sign-in (or it times out).
- */
+/** MSAL's scope list comes from the token response. A public client can have other prior grants. */
+export function validateGrant(result: AuthenticationResult | null, scopes: string[]): asserts result is AuthenticationResult {
+  if (!result?.accessToken || !result.account || result.account.tenantId !== PERSONAL_TENANT ||
+      !hasExpectedScopes(result.scopes, scopes)) {
+    throw new AppError("permission_denied", "Unexpected account or granted scopes. Revoke consent and review your app registration.");
+  }
+}
+
+const verificationPages = new Set([
+  "https://microsoft.com/link",
+  "https://www.microsoft.com/link",
+  "https://microsoft.com/devicelogin",
+  "https://www.microsoft.com/devicelogin",
+]);
+
 export async function acquireByDeviceCode(
   pca: PublicClientApplication,
   scopes: string[],
-  onDeviceCode: (info: DeviceCodeInfo) => void,
+  onUserCode: (code: string, verificationUri: string) => void,
 ): Promise<AuthenticationResult> {
-  const result = await pca.acquireTokenByDeviceCode({ scopes, deviceCodeCallback: onDeviceCode });
-  if (!result) throw new AppError("auth_required", "Device-code sign-in did not return a token.");
+  let result;
+  try {
+    result = await pca.acquireTokenByDeviceCode({ scopes, timeout: 900, deviceCodeCallback: ({ userCode, verificationUri }) => {
+      if (typeof userCode !== "string" || !/^[A-Z0-9-]{4,32}$/i.test(userCode)) throw new Error("Invalid code.");
+      if (!verificationPages.has(verificationUri)) throw new Error("Unrecognized verification page.");
+      onUserCode(userCode, verificationUri);
+    } });
+  } catch {
+    throw new AppError("auth_required", "Microsoft sign-in did not complete. Check the app registration and try again.");
+  }
+  validateGrant(result, scopes);
   return result;
 }
 
 export async function getCachedAccount(pca: PublicClientApplication): Promise<AccountInfo | null> {
   const accounts = await pca.getTokenCache().getAllAccounts();
-  return accounts[0] ?? null;
+  if (!accounts.length) return null;
+  const account = accounts[0];
+  if (accounts.length !== 1 || account?.tenantId !== PERSONAL_TENANT) {
+    throw new AppError("auth_required", "Unexpected cached accounts. Stop the server, log out locally, and sign in again.");
+  }
+  return account;
 }

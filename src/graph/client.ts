@@ -1,5 +1,7 @@
-import { AppError, mapGraphError } from "./errors";
-import type { AppConfig } from "../config";
+import { readBoundedText } from "../lib/http-body";
+import { graphUrl } from "./destination";
+import { AppError, mapGraphError, retryAfterSeconds } from "./errors";
+import { GRAPH_BASE, type AppConfig } from "../config";
 import type { IdGenerator } from "../lib/ids";
 import type { Logger } from "../lib/logger";
 
@@ -31,7 +33,6 @@ interface RequestOptions {
 const RETRYABLE_STATUS = new Set([429, 503, 504]);
 const MAX_RETRIES = 3;
 const MAX_BACKOFF_MS = 8_000;
-const MAX_RETRY_AFTER_MS = 30_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 export class GraphClient {
@@ -48,11 +49,28 @@ export class GraphClient {
   /** `pathOrUrl` is either a path relative to the Graph base or a full URL (e.g. an `@odata.nextLink`). */
   async request<T>(method: string, pathOrUrl: string, opts: RequestOptions = {}): Promise<T> {
     const url = this.buildUrl(pathOrUrl, opts.query);
-    const log = this.deps.logger.child({ traceId: opts.traceId, op: `${method} ${safePath(url)}` });
-    // A POST may have reached Graph even if we never saw the response — never auto-retry one
-    // on a transport-level failure (timeout / connection error / body read error). The caller
-    // can retry the tool call; the per-tool idempotency cache absorbs the duplicate.
-    const retrySafeOnTransportFailure = method.toUpperCase() !== "POST";
+    if (!["GET", "POST", "PATCH", "DELETE"].includes(method) ||
+        (method !== "GET" && (this.deps.config.readonly || this.deps.config.scopeReadonly)) ||
+        (method === "DELETE" && this.deps.config.noDestructive !== false)) {
+      throw new AppError("permission_denied", "This operation is disabled.");
+    }
+    const listId = new URL(url).pathname.split("/")[5];
+    if (listId) {
+      // Tasks.ReadWrite also covers shared lists. Check Graph's ownership flag before using
+      // a caller-supplied ID, including when the caller bypasses list discovery with a cursor.
+      const ownership = await this.send<{ id?: unknown; isOwner?: unknown } | null>(
+        "GET", graphUrl(GRAPH_BASE + "/me/todo/lists/" + listId + "?$select=id,isOwner").href, { traceId: opts.traceId },
+      );
+      if (ownership?.isOwner !== true || ownership.id !== decodeURIComponent(listId)) {
+        throw new AppError("permission_denied", "Access requires a task list owned by the signed-in account.");
+      }
+    }
+    return this.send<T>(method, url, opts);
+  }
+
+  private async send<T>(method: string, url: string, opts: RequestOptions): Promise<T> {
+    const log = this.deps.logger.child({ traceId: opts.traceId, op: method });
+    const canRetry = method === "GET";
 
     for (let attempt = 0; ; attempt++) {
       const clientRequestId = this.deps.ids.uuid();
@@ -64,6 +82,7 @@ export class GraphClient {
       try {
         res = await this.fetchImpl(url, {
           method,
+          redirect: "manual",
           headers: {
             Authorization: `Bearer ${token}`,
             "client-request-id": clientRequestId,
@@ -73,10 +92,25 @@ export class GraphClient {
           body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
           signal: AbortSignal.timeout(this.requestTimeoutMs),
         });
-        bodyText = await res.text();
+        if (res.status >= 300 && res.status < 400) {
+          await res.body?.cancel();
+          throw new AppError("graph_error", "Microsoft Graph returned a redirect.");
+        }
+        if (!res.ok || res.status === 204) {
+          await res.body?.cancel();
+          bodyText = "";
+        } else {
+          const mediaType = res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+          if (mediaType !== "application/json") {
+            await res.body?.cancel();
+            throw new AppError("graph_error", "Microsoft Graph returned an unexpected response type.");
+          }
+          bodyText = await readJsonText(res);
+        }
       } catch (err) {
+        if (err instanceof AppError) throw err;
         const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
-        if (retrySafeOnTransportFailure && attempt < MAX_RETRIES) {
+        if (canRetry && attempt < MAX_RETRIES) {
           const waitMs = this.backoffMs(attempt);
           log.warn(timedOut ? "request timed out — retrying" : "transport error — retrying", { clientRequestId, attempt, waitMs, outcome: "error" });
           await this.sleep(waitMs);
@@ -86,7 +120,7 @@ export class GraphClient {
           "graph_unavailable",
           timedOut
             ? `Microsoft Graph did not respond within ${Math.round(this.requestTimeoutMs / 1000)}s.`
-            : `Network error talking to Microsoft Graph: ${(err as Error).message}`,
+            : "Network error talking to Microsoft Graph.",
           { clientRequestId },
         );
       }
@@ -95,35 +129,32 @@ export class GraphClient {
 
       if (res.ok) {
         log.debug("graph ok", { clientRequestId, status: res.status, durationMs, outcome: "ok" });
-        if (!bodyText) return undefined as T;
+        if (res.status === 204) return undefined as T;
         try {
-          return JSON.parse(bodyText) as T;
-        } catch {
+          return JSON.parse(bodyText, (key: string, value: unknown) => {
+            if (key.includes(token) || (typeof value === "string" && value.includes(token))) {
+              throw new AppError("graph_error", "Microsoft Graph returned sensitive authentication data.");
+            }
+            return value;
+          }) as T;
+        } catch (err) {
+          if (err instanceof AppError) throw err;
           throw new AppError("graph_error", "Microsoft Graph returned a response that was not valid JSON.", { status: res.status, clientRequestId });
         }
       }
 
-      let parsedBody: unknown;
-      try {
-        parsedBody = bodyText ? JSON.parse(bodyText) : undefined;
-      } catch {
-        parsedBody = undefined;
-      }
-
-      if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
-        // 429/503/504 mean the request was not processed — safe to retry even for a POST.
-        const retryAfter = Number.parseInt(res.headers.get("retry-after") ?? "", 10);
+      if (canRetry && RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
+        const retryAfter = retryAfterSeconds(res.headers);
         // Honour Retry-After, but cap it — a tool call shouldn't block for minutes.
-        const waitMs = Number.isFinite(retryAfter) ? Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS) : this.backoffMs(attempt);
+        const waitMs = retryAfter === undefined ? this.backoffMs(attempt) : retryAfter * 1000;
         log.warn("retryable graph error", { clientRequestId, status: res.status, attempt, waitMs, durationMs, outcome: "error" });
         await this.sleep(waitMs);
         continue;
       }
 
-      const error = mapGraphError(res.status, parsedBody, res.headers);
+      const error = mapGraphError(res.status, clientRequestId, res.headers);
       log.error("graph error", {
         clientRequestId: error.clientRequestId ?? clientRequestId,
-        requestId: error.requestId,
         status: res.status,
         durationMs,
         outcome: "error",
@@ -134,13 +165,13 @@ export class GraphClient {
   }
 
   private buildUrl(pathOrUrl: string, query?: RequestOptions["query"]): string {
-    const url = new URL(pathOrUrl.startsWith("http") ? pathOrUrl : this.deps.config.graphBase + pathOrUrl);
+    const url = graphUrl(pathOrUrl.startsWith("/") ? GRAPH_BASE + pathOrUrl : pathOrUrl);
     if (query) {
       for (const [key, value] of Object.entries(query)) {
         if (value !== undefined) url.searchParams.set(key, String(value));
       }
     }
-    return url.toString();
+    return graphUrl(url.href).href;
   }
 
   private backoffMs(attempt: number): number {
@@ -150,10 +181,6 @@ export class GraphClient {
   }
 }
 
-function safePath(url: string): string {
-  try {
-    return new URL(url).pathname;
-  } catch {
-    return url;
-  }
+async function readJsonText(response: Response): Promise<string> {
+  return readBoundedText(response, 4 * 1024 * 1024, new AppError("graph_error", "Microsoft Graph response was empty or exceeded the size limit."));
 }

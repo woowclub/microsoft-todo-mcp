@@ -50,6 +50,7 @@ export class TasksApi {
       () => this.graph.request<Page<unknown>>("GET", base, { query, traceId: opts.traceId }),
       (url) => this.graph.request<Page<unknown>>("GET", url, { traceId: opts.traceId }),
       cap,
+      base,
       opts.cursor,
     );
     return { items: result.items.map((x) => TaskSchema.parse(x)), hasMore: result.hasMore, cursor: result.cursor };
@@ -89,12 +90,14 @@ export class TasksApi {
   }
 
   async listChecklist(listId: string, taskId: string, traceId?: string): Promise<ChecklistItem[]> {
-    const res = await this.graph.request<Page<unknown>>(
-      "GET",
-      `/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems`,
-      { traceId },
+    const collection = `/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems`;
+    const page = await collectPages<unknown>(
+      () => this.graph.request<Page<unknown>>("GET", collection, { traceId }),
+      (url) => this.graph.request<Page<unknown>>("GET", url, { traceId }),
+      Infinity,
+      collection,
     );
-    return res.value.map((x) => ChecklistItemSchema.parse(x));
+    return page.items.map((item) => ChecklistItemSchema.parse(item));
   }
 
   async addChecklistItem(listId: string, taskId: string, displayName: string, isChecked: boolean, traceId?: string): Promise<ChecklistItem> {

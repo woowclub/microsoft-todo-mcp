@@ -1,9 +1,9 @@
+#!/usr/bin/env node
 import { loadConfig, scopesFor } from "./config";
-import { createLogger } from "./lib/logger";
 import { runServer } from "./server";
 import { acquireByDeviceCode, createPca, getCachedAccount } from "./auth/device-code";
 import { clearCache } from "./auth/token-cache";
-import { toAppError } from "./graph/errors";
+import { AppError, toAppError } from "./graph/errors";
 import { VERSION } from "./version";
 
 interface ParsedArgs {
@@ -46,8 +46,7 @@ Flags (serve):
   --scope-readonly   Request only the Tasks.Read scope (requires re-login)
 
 Env:
-  MS_TODO_CLIENT_ID, MS_TODO_AUTHORITY, MS_TODO_TOKEN_CACHE,
-  MS_TODO_MAX_RESULTS, MS_TODO_GRAPH_BASE, LOG_LEVEL
+  MS_TODO_CLIENT_ID, MS_TODO_MAX_RESULTS, MS_TODO_ALLOW_DESTRUCTIVE, LOG_LEVEL
 
 First-time setup: docs/ENTRA-APP-SETUP.md
 `;
@@ -65,7 +64,6 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig({ ...process.env, ...flagOverrides(flags) });
-  const logger = createLogger(config.logLevel);
 
   switch (cmd) {
     case "serve":
@@ -73,30 +71,34 @@ async function main(): Promise<void> {
       return;
 
     case "login": {
-      const result = await acquireByDeviceCode(createPca(config, logger), scopesFor(config), (info) => {
-        process.stdout.write(`\n${info.message}\n\n`);
+      if (!process.stdin.isTTY || !process.stdout.isTTY) throw new AppError("auth_required", "Run login in an interactive terminal.");
+      const pca = createPca(config);
+      if (await getCachedAccount(pca)) throw new AppError("auth_required", "Stop the server and run logout before starting a new login.");
+      await acquireByDeviceCode(pca, scopesFor(config), (code, verificationUri) => {
+        process.stdout.write(`Open ${verificationUri} and enter this code:\n${code}\nReview the account, app and permissions before consenting.\n`);
       });
-      process.stdout.write(`Signed in as ${result.account?.username ?? "an unknown account"}.\n`);
+      process.stdout.write("Signed in. Restart your MCP server.\n");
       return;
     }
 
     case "logout":
+      if (!config.clientId) throw new AppError("config_error", "Set the original MS_TODO_CLIENT_ID before logging out.");
       await clearCache(config.tokenCachePath);
       process.stdout.write("Signed out (token cache cleared).\n");
       return;
 
     case "whoami": {
-      const account = await getCachedAccount(createPca(config, logger));
+      const account = await getCachedAccount(createPca(config));
       if (!account) {
         process.stdout.write("Not signed in. Run `microsoft-todo-mcp login`.\n");
         return;
       }
-      process.stdout.write(`${account.username}${account.name ? ` (${account.name})` : ""} — tenant ${account.tenantId}\n`);
+      process.stdout.write(JSON.stringify({ username: account.username, tenantId: account.tenantId }) + "\n");
       return;
     }
 
     default:
-      process.stderr.write(`Unknown command: ${cmd}\n\n${HELP}`);
+      process.stderr.write(`Unknown command.\n\n${HELP}`);
       process.exitCode = 1;
   }
 }

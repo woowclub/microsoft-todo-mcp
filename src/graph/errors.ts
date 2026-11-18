@@ -54,25 +54,23 @@ export class AppError extends Error {
 
 export function toAppError(err: unknown): AppError {
   if (err instanceof AppError) return err;
-  return new AppError("internal_error", err instanceof Error ? err.message : String(err));
+  return new AppError("internal_error", "An unexpected error occurred.");
 }
 
-interface GraphErrorBody {
-  error?: { code?: string; message?: string; innerError?: Record<string, unknown> };
+/** Honor bounded whole seconds only. Remote header text must never reach diagnostics. */
+export function retryAfterSeconds(headers: Headers): number | undefined {
+  const value = headers.get("retry-after");
+  return value !== null && /^\d{1,6}$/.test(value) ? Math.min(Number(value), 30) : undefined;
 }
 
-/** Map a Graph HTTP error response onto the taxonomy. */
-export function mapGraphError(status: number, body: unknown, headers: Headers): AppError {
-  const requestId = headers.get("request-id") ?? undefined;
-  const clientRequestId = headers.get("client-request-id") ?? undefined;
-  const graph = (body as GraphErrorBody | undefined)?.error;
-  const graphCode = graph?.code;
-  const message = graph?.message || `Microsoft Graph request failed (HTTP ${status})`;
-  const base = { requestId, clientRequestId, status, details: graphCode ? { graphCode } : undefined };
+/** Do not expose remote error bodies, HTTP headers or transport exception messages. */
+export function mapGraphError(status: number, clientRequestId: string, headers: Headers): AppError {
+  const message = `Microsoft Graph request failed (HTTP ${status}).`;
+  const base = { clientRequestId, status };
 
   switch (status) {
     case 401:
-      return new AppError("auth_expired", "Microsoft rejected the access token (401). Run `microsoft-todo-mcp login` again.", base);
+      return new AppError("auth_expired", "Microsoft rejected the access token (401). Stop the server, log out locally, then sign in again.", base);
     case 403:
       return new AppError("permission_denied", message, base);
     case 404:
@@ -81,10 +79,9 @@ export function mapGraphError(status: number, body: unknown, headers: Headers): 
     case 412:
       return new AppError("conflict", message, base);
     case 429: {
-      const ra = Number.parseInt(headers.get("retry-after") ?? "", 10);
       return new AppError("rate_limited", "Microsoft Graph throttled the request (429).", {
         ...base,
-        retryAfterSeconds: Number.isFinite(ra) ? ra : undefined,
+        retryAfterSeconds: retryAfterSeconds(headers),
       });
     }
     case 503:

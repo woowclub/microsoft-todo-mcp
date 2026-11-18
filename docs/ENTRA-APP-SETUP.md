@@ -1,44 +1,10 @@
-# Using your own Microsoft Entra app (optional)
+# Register the personal To Do public client
 
-> **You don't need this.** By default `microsoft-todo-mcp` uses the well-known *Microsoft Graph CLI* public client id, so it works with no registration. Follow this only if you want the app to appear under your own name on the Microsoft consent screen / in audit logs — e.g. for a workplace deployment.
+1. Open the Microsoft Entra admin center. In a directory where you may create registrations, open **Entra ID → App registrations → New registration**. The directory hosts the registration. Your personal account will sign in as its user. [Microsoft registration guide](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)
+2. Choose a recognizable name such as **My local To Do on Mac** and select **Personal Microsoft accounts only**. Leave the redirect URI blank and register.
+3. In **Authentication**, enable **Allow public client flows** and save. Device-code sign-in runs in a separate browser and needs no callback listener or client secret.
+4. In **API permissions**, remove the default delegated User.Read if present. Choose **Add a permission → Microsoft Graph → Delegated permissions → Tasks.ReadWrite**. Verify this is the only configured API permission. Leave application permissions, certificates and secrets empty. [Microsoft permission configuration](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-configure-app-access-web-apis)
+5. Copy the **Application (client) ID** from Overview. Configure the local CLI and Codex with this value. The dedicated ID gives this fork its own consent record and revocation control. A public ID proves neither the identity of the binary nor the integrity of the checkout.
+6. At login, expect your app name, task read/write access, basic sign-in/profile information and continued access. MSAL adds openid and profile for identity and offline_access for silent refresh. Stop if Microsoft asks for mail, files, calendars, contacts or other resource access. Review both the permissions page and the browser consent prompt. [OIDC scopes](https://learn.microsoft.com/en-us/entra/identity-platform/scopes-oidc) · [Graph task permission](https://learn.microsoft.com/en-us/graph/permissions-reference#tasksreadwrite)
 
-To register your own app you need *a* Microsoft account with access to an Entra tenant. A **personal** Microsoft account works: signing in to <https://portal.azure.com> with it provisions a free directory automatically — no Azure subscription or credit card. App registrations are free.
-
-## Steps
-
-1. Go to <https://portal.azure.com>, sign in, and search **"App registrations"** in the top bar — or open it directly: <https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade>. Click **+ New registration**. (The Microsoft Entra admin center at <https://entra.microsoft.com> has the same thing under *Applications → App registrations*, but its left-nav layout changes often — the Azure-portal search box is more stable.)
-
-2. **Name:** anything, e.g. `microsoft-todo-mcp`.
-
-3. **Supported account types:** pick **"Accounts in any organizational directory and personal Microsoft accounts"** for the widest reach. (If you only ever use one work tenant and want to lock it down, pick single-tenant — then later set `MS_TODO_AUTHORITY=https://login.microsoftonline.com/<your-tenant-id>`.)
-
-4. **Redirect URI:** leave it **blank**. The device-code flow doesn't use one.
-
-5. Click **Register**.
-
-6. On the app's **Overview** page, copy the **Application (client) ID** — this is your `MS_TODO_CLIENT_ID`. (A public-client ID is not a secret; it's fine to put in config or even commit.)
-
-7. Go to **Authentication** → scroll to **Advanced settings** → set **"Allow public client flows"** to **Yes** → **Save**. (Device-code is a public-client flow; without this, login fails.)
-
-8. Go to **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated permissions** → search **`Tasks`** → check **`Tasks.ReadWrite`** (and `Tasks.ReadWrite.Shared` too if you want shared lists) → **Add permissions**. `offline_access` (for the refresh token) is requested automatically; you don't need to add it.
-
-9. **Admin consent:** for personal accounts and `Tasks.ReadWrite` on most tenants you'll just consent yourself on first login — nothing to do here. If your organization restricts user consent, an admin needs to click **"Grant admin consent for <tenant>"** on the API permissions page.
-
-## Use it
-
-Set the client ID wherever your MCP client passes env vars (see the README's quick-start), then run the one-time login:
-
-```bash
-MS_TODO_CLIENT_ID=<your-application-client-id> npx -y microsoft-todo-mcp login
-```
-
-If you registered a **single-tenant** app, also set:
-
-```bash
-MS_TODO_AUTHORITY=https://login.microsoftonline.com/<your-tenant-id>
-```
-
-## Removing access
-
-- Server side: `npx microsoft-todo-mcp logout` (deletes the local token cache).
-- Account side: revoke the app at <https://myapps.microsoft.com> (work/school) or <https://account.live.com/consent/Manage> (personal). Deleting the app registration also invalidates everything.
+Tasks.ReadWrite permits deletion and can cover shared tasks and lists. This fork restricts its HTTP routes and enforces its own ownership and deletion rules. A copied bearer token carries the Microsoft grant. [Build and local login](../README.md)

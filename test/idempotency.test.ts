@@ -30,3 +30,10 @@ describe("IdempotencyCache", () => {
     expect(IdempotencyCache.key({ ...base, tool: "a", accountId: "one" })).not.toBe(IdempotencyCache.key({ ...base, tool: "a", accountId: "two" }));
   });
 });
+
+it("bounds retained task content even with many distinct creates", () => {
+  const cache = new IdempotencyCache({ now: () => 1000 }, 60000);
+  for (let i = 0; i < 129; i++) cache.set(String(i), i);
+  expect(cache.get("0")).toBeUndefined();
+  expect(cache.get("128")).toBe(128);
+});

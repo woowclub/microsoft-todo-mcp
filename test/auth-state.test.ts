@@ -1,138 +1,175 @@
-import { describe, expect, it } from "vitest";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import type { PublicClientApplication } from "@azure/msal-node";
 import { AuthManager } from "../src/auth/auth-state";
+import { acquireByDeviceCode, createPca, validateGrant } from "../src/auth/device-code";
+import { loadConfig, PERSONAL_AUTHORITY, PERSONAL_TENANT, scopesFor } from "../src/config";
 import { createLogger } from "../src/lib/logger";
 
-const silent = createLogger("silent");
-
-interface FakeAccount {
-  username: string;
-  name?: string;
-  homeAccountId: string;
-  tenantId: string;
+const scopes = ["Tasks.ReadWrite"];
+const account = { username: "private@example.test", homeAccountId: "home-1", tenantId: PERSONAL_TENANT };
+const good = () => ({ account, accessToken: "test-only", expiresOn: new Date(Date.now() + 3_600_000), scopes });
+function fixture(accounts: object[] = [], silent = async (): Promise<unknown> => good()) {
+  const acquireTokenSilent = vi.fn(silent);
+  const acquireTokenByDeviceCode = vi.fn();
+  const pca = {
+    getTokenCache: () => ({ getAllAccounts: async () => accounts }),
+    acquireTokenSilent,
+    acquireTokenByDeviceCode,
+  } as unknown as PublicClientApplication;
+  const auth = new AuthManager(pca, scopes, createLogger("silent"));
+  return { auth, pca, acquireTokenSilent, acquireTokenByDeviceCode };
 }
 
-const DEVICE_CODE = {
-  userCode: "ABCD-EFGH",
-  verificationUri: "https://microsoft.com/devicelogin",
-  message: "To sign in, open https://microsoft.com/devicelogin and enter the code ABCD-EFGH",
-  expiresIn: 900,
-};
-
-function fakePca(
-  opts: {
-    accounts?: FakeAccount[];
-    silentResult?: () => Promise<unknown>;
-    /** Resolves to an AuthenticationResult, rejects, or never settles (default: never — poll pending). */
-    deviceCodeResult?: () => Promise<unknown>;
-    onDeviceCodeCall?: () => void;
-  } = {},
-) {
-  return {
-    getTokenCache: () => ({ getAllAccounts: async () => opts.accounts ?? [] }),
-    acquireTokenSilent: opts.silentResult ?? (async () => { throw new Error("no_silent_token"); }),
-    acquireTokenByDeviceCode: async ({ deviceCodeCallback }: { deviceCodeCallback: (info: typeof DEVICE_CODE) => void; scopes: string[] }) => {
-      opts.onDeviceCodeCall?.();
-      deviceCodeCallback(DEVICE_CODE);
-      return (opts.deviceCodeResult ?? (() => new Promise(() => {})))();
-    },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } as any;
-}
-
-const tick = (ms = 5) => new Promise((r) => setTimeout(r, ms));
-
-describe("AuthManager", () => {
-  it("starts uninitialized with no cached account", async () => {
-    const auth = new AuthManager(fakePca(), ["Tasks.ReadWrite"], silent);
-    await auth.init();
-    expect(auth.status().state).toBe("uninitialized");
-    expect(auth.hasAccount()).toBe(false);
+describe("personal-account authentication", () => {
+  it("requires a dedicated client ID and fixes the authority and task scopes", () => {
+    const config = loadConfig({});
+    expect(config.clientId).toBe("");
+    expect(config.authority).toBe(PERSONAL_AUTHORITY);
+    expect(scopesFor(config)).toEqual(["Tasks.ReadWrite"]);
+    const ro = loadConfig({ MS_TODO_SCOPE_READONLY: "1" });
+    expect(scopesFor(ro)).toEqual(["Tasks.Read"]);
+    expect(ro.tokenCachePath).not.toBe(config.tokenCachePath);
+    expect(() => loadConfig({ MS_TODO_CLIENT_ID: "../client" })).toThrow();
+    expect(() => loadConfig({ MS_TODO_AUTHORITY: "https://example.test" })).toThrow();
+    expect(() => loadConfig({ MS_TODO_TOKEN_CACHE: "/tmp/shared.json" })).toThrow();
   });
 
-  it("getAccessToken with no account starts a device-code sign-in and reports the code", async () => {
-    const auth = new AuthManager(fakePca(), ["Tasks.ReadWrite"], silent);
-    await auth.init();
-    await expect(auth.getAccessToken()).rejects.toMatchObject({
-      code: "auth_required",
-      details: { userCode: "ABCD-EFGH", verificationUri: "https://microsoft.com/devicelogin", status: "started" },
+  it.each([
+    "https://microsoft.com/link", "https://www.microsoft.com/link",
+    "https://microsoft.com/devicelogin", "https://www.microsoft.com/devicelogin",
+  ])("preserves the issued verification page %s", async (verificationUri) => {
+    const { pca, acquireTokenByDeviceCode } = fixture();
+    acquireTokenByDeviceCode.mockImplementation(async ({ deviceCodeCallback }) => {
+      deviceCodeCallback({ userCode: "TESTONLY", verificationUri });
+      return good();
     });
-    expect(auth.status().state).toBe("device_code_pending");
-    expect(auth.status().pendingSignIn?.userCode).toBe("ABCD-EFGH");
+    const prompt = vi.fn();
+    await acquireByDeviceCode(pca, scopes, prompt);
+    expect(prompt).toHaveBeenCalledWith("TESTONLY", verificationUri);
   });
 
-  it("a second getAccessToken while a sign-in is pending reports it pending, without starting a new flow", async () => {
-    let deviceCodeCalls = 0;
-    const auth = new AuthManager(fakePca({ onDeviceCodeCall: () => { deviceCodeCalls += 1; } }), ["Tasks.ReadWrite"], silent);
-    await auth.init();
-    await expect(auth.getAccessToken()).rejects.toMatchObject({ details: { status: "started" } });
-    await expect(auth.getAccessToken()).rejects.toMatchObject({ details: { status: "pending", userCode: "ABCD-EFGH" } });
-    expect(deviceCodeCalls).toBe(1);
+  it.each([undefined, "http://microsoft.com/link", "https://microsoft.com.example/link",
+    "https://microsoft.com/link?next=private", "https://microsoft.com/unrecognized",
+  ])("suppresses the prompt for an unsupported verification page", async (verificationUri) => {
+    const { pca, acquireTokenByDeviceCode } = fixture();
+    acquireTokenByDeviceCode.mockImplementation(async ({ deviceCodeCallback }) => {
+      deviceCodeCallback({ userCode: "TESTONLY", verificationUri });
+      return good();
+    });
+    const prompt = vi.fn();
+    await expect(acquireByDeviceCode(pca, scopes, prompt)).rejects.toMatchObject({ code: "auth_required" });
+    expect(prompt).not.toHaveBeenCalled();
   });
 
-  it("signIn returns the device code; once the background poll resolves, getAccessToken returns the token", async () => {
-    const account: FakeAccount = { username: "u@example.com", name: "U", homeAccountId: "home-1", tenantId: "tenant-1" };
-    const auth = new AuthManager(
-      fakePca({ deviceCodeResult: async () => ({ accessToken: "tok-device", account, expiresOn: new Date(Date.now() + 3_600_000) }) }),
-      ["Tasks.ReadWrite"],
-      silent,
-    );
+  it("never starts an interactive flow for an MCP request", async () => {
+    const { auth, acquireTokenByDeviceCode } = fixture();
     await auth.init();
-    const code = await auth.signIn();
-    expect(code.userCode).toBe("ABCD-EFGH");
-    expect(auth.status().state).toBe("device_code_pending");
-    await tick();
-    expect(await auth.getAccessToken()).toBe("tok-device");
-    expect(auth.status().state).toBe("authenticated");
-    expect(auth.accountId()).toBe("home-1");
+    await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "auth_required" });
+    expect(auth.status()).toEqual({ state: "uninitialized" });
+    expect(acquireTokenByDeviceCode).not.toHaveBeenCalled();
   });
 
-  it("authenticates via a silent token when a cached account exists", async () => {
-    const account: FakeAccount = { username: "u@example.com", name: "U", homeAccountId: "home-1", tenantId: "tenant-1" };
-    const auth = new AuthManager(
-      fakePca({ accounts: [account], silentResult: async () => ({ accessToken: "tok-silent", expiresOn: new Date(Date.now() + 3_600_000), account }) }),
-      ["Tasks.ReadWrite"],
-      silent,
-    );
+  it("shares concurrent refreshes and caches only a validated unexpired token", async () => {
+    const { auth, acquireTokenSilent } = fixture([account]);
     await auth.init();
-    expect(auth.status().state).toBe("token_expired");
-    expect(await auth.getAccessToken()).toBe("tok-silent");
-    expect(auth.status().state).toBe("authenticated");
+    expect(await Promise.all([auth.getAccessToken(), auth.getAccessToken()])).toEqual(["test-only", "test-only"]);
+    expect(await auth.getAccessToken()).toBe("test-only");
+    expect(acquireTokenSilent).toHaveBeenCalledTimes(1);
+    expect(auth.status()).toEqual({ state: "authenticated", tokenExpiresOn: expect.any(String) });
+    expect(auth.accountId()).toBe(account.homeAccountId);
   });
 
-  it("caches the access token until it nears expiry", async () => {
-    let now = 10_000;
-    let calls = 0;
-    const account: FakeAccount = { username: "u@example.com", homeAccountId: "home-1", tenantId: "tenant-1" };
-    const auth = new AuthManager(
-      fakePca({ accounts: [account], silentResult: async () => { calls += 1; return { accessToken: `tok-${calls}`, expiresOn: new Date(now + 3_600_000), account }; } }),
-      ["Tasks.ReadWrite"],
-      silent,
-      () => now,
-    );
-    await auth.init();
-    expect(await auth.getAccessToken()).toBe("tok-1");
-    now += 60_000;
-    expect(await auth.getAccessToken()).toBe("tok-1");
-    expect(calls).toBe(1);
+  it.each([[account, account], [{ ...account, tenantId: "unrelated" }]])("rejects ambiguous or non-personal accounts", async (...accounts) => {
+    const { auth } = fixture(accounts);
+    await expect(auth.init()).rejects.toMatchObject({ code: "auth_required" });
   });
 
-  it("when the silent refresh fails, falls back to a device-code sign-in", async () => {
-    const account: FakeAccount = { username: "u@example.com", homeAccountId: "home-1", tenantId: "tenant-1" };
-    const auth = new AuthManager(
-      fakePca({ accounts: [account], silentResult: async () => { throw new Error("interaction_required"); } }),
-      ["Tasks.ReadWrite"],
-      silent,
-    );
-    await auth.init();
-    await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "auth_required", details: { userCode: "ABCD-EFGH" } });
-    expect(auth.status().state).toBe("device_code_pending");
+  it("rejects extra granted Graph scopes and changed account identity", async () => {
+    for (const bad of [{ ...good(), scopes: [...scopes, "Mail.Read"] }, { ...good(), account: { ...account, homeAccountId: "other" } }]) {
+      const { auth } = fixture([account], async () => bad);
+      await auth.init();
+      await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "auth_required" });
+      expect(auth.status()).toEqual({ state: "refresh_failed" });
+    }
+    const { pca, acquireTokenByDeviceCode } = fixture();
+    acquireTokenByDeviceCode.mockResolvedValue({ ...good(), scopes: ["Files.Read"] });
+    await expect(acquireByDeviceCode(pca, scopes, vi.fn())).rejects.toMatchObject({ code: "permission_denied" });
+    expect(() => validateGrant(null, scopes)).toThrow();
   });
 
-  it("reports config_error and never signs in when constructed without a client id", async () => {
-    const auth = new AuthManager(null, ["Tasks.ReadWrite"], silent, undefined, "no client id configured");
+  it("keeps provider errors and codes out of failures", async () => {
+    const { auth, pca, acquireTokenByDeviceCode } = fixture([account], async () => { throw new Error("test-only-secret"); });
+    acquireTokenByDeviceCode.mockRejectedValue(new Error("test-only-secret"));
     await auth.init();
-    expect(auth.status()).toMatchObject({ state: "uninitialized", configError: "no client id configured" });
+    for (const op of [() => auth.getAccessToken(), () => acquireByDeviceCode(pca, scopes, vi.fn())]) {
+      await expect(op()).rejects.not.toThrow(/test-only-secret/);
+    }
+  });
+
+  it("reports configuration errors without fetching credentials", async () => {
+    const auth = new AuthManager(null, scopes, createLogger("silent"), undefined, "Set MS_TODO_CLIENT_ID.");
     await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "config_error" });
-    await expect(auth.signIn()).rejects.toMatchObject({ code: "config_error" });
   });
+});
+
+describe("Microsoft identity transport", () => {
+  it("pins discovery and credential POSTs to Microsoft and disables redirects", async () => {
+    const { microsoftIdentityNetwork } = await import("../src/auth/network");
+    const transport = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ access_token: "fixture" }));
+    const network = microsoftIdentityNetwork(scopes, transport);
+    const body = "scope=Tasks.ReadWrite&refresh_token=fake&x-client-last-telemetry=fixture";
+    for (const url of ["https://example.test/consumers/oauth2/v2.0/token", PERSONAL_AUTHORITY + "/other", PERSONAL_AUTHORITY.replace("https", "http") + "/oauth2/v2.0/token"]) {
+      await expect(network.sendPostRequestAsync(url, { body })).rejects.toMatchObject({ code: "auth_required" });
+    }
+    expect(transport).not.toHaveBeenCalled();
+    await network.sendPostRequestAsync(PERSONAL_AUTHORITY + "/oauth2/v2.0/token", { body });
+    expect(transport).toHaveBeenCalledWith(new URL(PERSONAL_AUTHORITY + "/oauth2/v2.0/token"), expect.objectContaining({
+      body: "scope=Tasks.ReadWrite&refresh_token=fake", method: "POST", redirect: "error", signal: expect.any(AbortSignal),
+    }));
+    transport.mockResolvedValueOnce(new Response(null, { status: 307, headers: { location: "https://example.test/" } }));
+    await expect(network.sendPostRequestAsync(PERSONAL_AUTHORITY + "/oauth2/v2.0/token", { body })).rejects.toThrow("Microsoft identity request failed.");
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("MSAL grant handling", () => {
+  it("rejects an expanded grant before the SDK can persist the response", async () => {
+    const { microsoftIdentityNetwork } = await import("../src/auth/network");
+    const transport = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ access_token: "test-only", scope: "Tasks.ReadWrite Files.Read" }));
+    const network = microsoftIdentityNetwork(scopes, transport);
+    await expect(network.sendPostRequestAsync(PERSONAL_AUTHORITY + "/oauth2/v2.0/token", {
+      body: "scope=Tasks.ReadWrite&refresh_token=fake",
+    })).rejects.toMatchObject({ code: "auth_required" });
+    await expect(network.sendPostRequestAsync(PERSONAL_AUTHORITY + "/oauth2/v2.0/devicecode", {
+      body: "scope=Mail.Read",
+    })).rejects.toMatchObject({ code: "auth_required" });
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+});
+
+it("applies the transport and expected OAuth scopes on an actual MSAL refresh request", async () => {
+  const dir = await mkdtemp(join(await realpath("/tmp"), "todo-msal-"));
+  const transport = vi.fn<typeof fetch>().mockImplementation(async () =>
+    Response.json({ error: "invalid_grant", error_description: "synthetic rejection" }, { status: 400 }));
+  vi.stubGlobal("fetch", transport);
+  try {
+    const config = loadConfig({ MS_TODO_CLIENT_ID: "00000000-0000-4000-8000-000000000001" });
+    const pca = createPca({ ...config, tokenCachePath: join(dir, "fixture.json") });
+    await expect(pca.acquireTokenByRefreshToken({ refreshToken: "fixture-only", scopes: scopesFor(config) })).rejects.toThrow();
+    const post = transport.mock.calls.filter(([, options]) => options?.method === "POST");
+    expect(post).toHaveLength(1);
+    const [url, options] = post[0]!;
+    expect(new URL(String(url)).pathname).toBe("/consumers/oauth2/v2.0/token");
+    expect(new URL(String(url)).origin).toBe("https://login.microsoftonline.com");
+    expect(options?.redirect).toBe("error");
+    const body = new URLSearchParams(String(options?.body));
+    expect(body.get("refresh_token")).toBe("fixture-only");
+    expect(body.get("scope")?.split(" ").sort()).toEqual(["Tasks.ReadWrite", "offline_access", "openid", "profile"].sort());
+    expect([...body.keys()].some((k) => k.includes("telemetry"))).toBe(false);
+  } finally {
+    vi.unstubAllGlobals();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

@@ -24,7 +24,7 @@ export interface ToolDef {
   name: string;
   description: string;
   risk: RiskClass;
-  /** Zod raw shape — passed straight to `server.tool()`. */
+  /** Source of both strict runtime validation and the advertised JSON Schema. */
   inputShape: z.ZodRawShape;
   handler: (args: Record<string, unknown>, ctx: ToolContext) => Promise<unknown>;
 }

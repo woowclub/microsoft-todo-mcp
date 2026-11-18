@@ -8,16 +8,18 @@ export type LogLevel = "silent" | "error" | "warn" | "info" | "debug";
 const ORDER: Record<LogLevel, number> = { silent: 0, error: 1, warn: 2, info: 3, debug: 4 };
 const LEVELS = new Set<string>(["silent", "error", "warn", "info", "debug"]);
 
-const REDACT_KEYS = new Set(["authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "id_token", "token", "bearer", "secret", "password"]);
-
-function redact(value: unknown, depth = 0): unknown {
-  if (depth > 6 || value == null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((v) => redact(v, depth + 1));
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    out[k] = REDACT_KEYS.has(k.toLowerCase()) ? "[REDACTED]" : redact(v, depth + 1);
+// Emit only operational metadata. Arbitrary provider messages, task content, paths,
+// nested objects and HTTP headers have no place in a local security log.
+function safeFields(fields: LogFields): Record<string, unknown> {
+  const safe: Record<string, unknown> = {};
+  for (const key of ["durationMs", "status", "attempt", "waitMs", "registeredTools", "skippedTools"]) {
+    if (typeof fields[key] === "number" && Number.isFinite(fields[key])) safe[key] = fields[key];
   }
-  return out;
+  for (const key of ["clientIdConfigured", "readonly", "noDestructive", "scopeReadonly"]) {
+    if (typeof fields[key] === "boolean") safe[key] = fields[key];
+  }
+  if (fields.outcome === "ok" || fields.outcome === "error") safe.outcome = fields.outcome;
+  return safe;
 }
 
 export interface LogFields {
@@ -49,7 +51,7 @@ export class Logger {
 
   private write(level: Exclude<LogLevel, "silent">, msg: string, fields: LogFields = {}): void {
     if (ORDER[level] > ORDER[this.level]) return;
-    const line = { level, time: new Date().toISOString(), msg, ...(redact({ ...this.base, ...fields }) as object) };
+    const line = { level, time: new Date().toISOString(), msg, ...safeFields({ ...this.base, ...fields }) };
     process.stderr.write(JSON.stringify(line) + "\n");
   }
 }

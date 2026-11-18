@@ -1,3 +1,4 @@
+import { pageUrl } from "./destination";
 import { AppError } from "./errors";
 
 /** OData collection response. */
@@ -13,16 +14,21 @@ export interface PagedResult<T> {
   cursor?: string;
 }
 
-export function encodeCursor(nextLink: string): string {
+function encodeCursor(nextLink: string): string {
   return Buffer.from(nextLink, "utf-8").toString("base64url");
 }
 
-export function decodeCursor(cursor: string): string {
-  return Buffer.from(cursor, "base64url").toString("utf-8");
+function decodeCursor(cursor: string): string {
+  if (typeof cursor !== "string" || cursor.length > 10923 || !/^[A-Za-z0-9_-]+$/.test(cursor)) {
+    throw new AppError("validation_error", "Invalid pagination cursor.");
+  }
+  const link = Buffer.from(cursor, "base64url").toString("utf8");
+  if (encodeCursor(link) !== cursor) throw new AppError("validation_error", "Invalid pagination cursor.");
+  return link;
 }
 
-/** Safety bound against a pathological / non-terminating `@odata.nextLink` chain. */
-const MAX_PAGES = 1000;
+const MAX_PAGES = 32;
+const MAX_TOTAL_BYTES = 8 * 1024 * 1024;
 
 /**
  * Follow `@odata.nextLink` until we have at least `softCap` items (page-granular — we never
@@ -33,17 +39,28 @@ export async function collectPages<T>(
   fetchFirst: () => Promise<Page<T>>,
   fetchNext: (absoluteUrl: string) => Promise<Page<T>>,
   softCap: number,
+  collection: string,
   startCursor?: string,
 ): Promise<PagedResult<T>> {
   const items: T[] = [];
-  let page: Page<T> = startCursor ? await fetchNext(decodeCursor(startCursor)) : await fetchFirst();
+  let url = startCursor === undefined ? undefined : pageUrl(decodeCursor(startCursor), collection);
+  const visited = new Set<string>();
+  let bytes = 0;
 
   for (let pages = 1; ; pages++) {
+    if (url && visited.has(url)) throw new AppError("graph_error", "Microsoft Graph returned a repeated pagination link.");
+    if (url) visited.add(url);
+    const page: Page<T> = url ? await fetchNext(url) : await fetchFirst();
+    if (!page || !Array.isArray(page.value) || page.value.length > 1000) {
+      throw new AppError("graph_error", "Microsoft Graph returned an invalid collection.");
+    }
+    bytes += Buffer.byteLength(JSON.stringify(page.value));
+    if (bytes > MAX_TOTAL_BYTES) throw new AppError("graph_error", "Microsoft Graph collection exceeded the size limit.");
     items.push(...page.value);
     const next = page["@odata.nextLink"];
-    if (!next) return { items, hasMore: false };
-    if (items.length >= softCap) return { items, hasMore: true, cursor: encodeCursor(next) };
+    if (next === undefined) return { items, hasMore: false };
+    url = pageUrl(next, collection);
+    if (items.length >= softCap) return { items, hasMore: true, cursor: encodeCursor(url) };
     if (pages >= MAX_PAGES) throw new AppError("graph_error", `Pagination did not terminate after ${MAX_PAGES} pages.`);
-    page = await fetchNext(next);
   }
 }

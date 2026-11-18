@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DateTimeInput, Importance, TaskStatus } from "../lib/schema";
+import { Categories, Cursor, DateTimeInput, DisplayName, Importance, ResourceId, TaskStatus } from "../lib/schema";
 import { defineTool, withIdempotency } from "./_shared";
 
 export const taskTools = [
@@ -8,11 +8,11 @@ export const taskTools = [
     description: "List tasks in a To Do list. Optionally filter by status and expand checklist items / linked resources inline.",
     risk: "read",
     input: {
-      listId: z.string(),
+      listId: ResourceId,
       status: z.enum(["all", "notStarted", "inProgress", "completed"]).optional().describe("Filter by status; default 'all'"),
       includeChecklist: z.boolean().optional(),
       includeLinkedResources: z.boolean().optional(),
-      cursor: z.string().optional(),
+      cursor: Cursor.optional(),
       maxResults: z.number().int().min(1).max(1000).optional(),
     },
     handler: (args, ctx) =>
@@ -31,8 +31,8 @@ export const taskTools = [
     description: "Get a single To Do task by id.",
     risk: "read",
     input: {
-      listId: z.string(),
-      taskId: z.string(),
+      listId: ResourceId,
+      taskId: ResourceId,
       includeChecklist: z.boolean().optional(),
       includeLinkedResources: z.boolean().optional(),
     },
@@ -49,14 +49,14 @@ export const taskTools = [
     description: "Create a new task in a To Do list.",
     risk: "write",
     input: {
-      listId: z.string(),
-      title: z.string().min(1),
-      body: z.string().optional().describe("Plain-text note/body"),
+      listId: ResourceId,
+      title: DisplayName,
+      body: z.string().max(65536).optional().describe("Plain-text note/body"),
       dueDateTime: DateTimeInput.optional().describe("Due date-time: ISO-8601 string (host timezone) or { dateTime, timeZone }"),
       reminderDateTime: DateTimeInput.optional(),
       importance: Importance.optional(),
       status: TaskStatus.optional(),
-      categories: z.array(z.string()).optional(),
+      categories: Categories.optional(),
     },
     handler: (args, ctx) =>
       withIdempotency(ctx, "create_task", args, () =>
@@ -82,15 +82,15 @@ export const taskTools = [
       "Update fields of an existing task. Pass null for dueDateTime/reminderDateTime to clear them. Set status to 'completed' to complete the task.",
     risk: "write",
     input: {
-      listId: z.string(),
-      taskId: z.string(),
-      title: z.string().min(1).optional(),
-      body: z.string().optional(),
+      listId: ResourceId,
+      taskId: ResourceId,
+      title: DisplayName.optional(),
+      body: z.string().max(65536).optional(),
       dueDateTime: DateTimeInput.nullable().optional(),
       reminderDateTime: DateTimeInput.nullable().optional(),
       importance: Importance.optional(),
       status: TaskStatus.optional(),
-      categories: z.array(z.string()).optional(),
+      categories: Categories.optional(),
     },
     handler: (args, ctx) =>
       ctx.tasks.update(
@@ -113,7 +113,7 @@ export const taskTools = [
     name: "complete_task",
     description: "Mark a task as completed (convenience for update_task with status='completed').",
     risk: "write",
-    input: { listId: z.string(), taskId: z.string() },
+    input: { listId: ResourceId, taskId: ResourceId },
     handler: (args, ctx) => ctx.tasks.complete(args.listId, args.taskId, ctx.ids.uuid()),
   }),
 
@@ -121,7 +121,7 @@ export const taskTools = [
     name: "delete_task",
     description: "Permanently delete a task. This cannot be undone.",
     risk: "destructive",
-    input: { listId: z.string(), taskId: z.string() },
+    input: { listId: ResourceId, taskId: ResourceId },
     handler: async (args, ctx) => {
       await ctx.tasks.remove(args.listId, args.taskId, ctx.ids.uuid());
       return { deleted: true, taskId: args.taskId };
